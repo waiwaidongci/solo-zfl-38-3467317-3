@@ -191,6 +191,13 @@ function internalBusy(entries, exceptIndex) {
 // 2) 与既有工单/会议不撞人；
 // 3) 桅区不被其他工单占用（同船同批内部条目允许同桅区串接，不允许重叠）；
 // 4) 工序依赖：起点不得早于前置工序结束。
+// 当日可排窗口（分钟）：上午、下午两段，段间午休天然不可排。
+function workWindows(cal) {
+  if (Array.isArray(cal.workWindows) && cal.workWindows.length) return cal.workWindows;
+  // 兜底归一化（旧内存结构）。
+  return [[cal.workMinutes?.[0] ?? 540, cal.workMinutes?.[1] ?? 720]];
+}
+
 function findSlot(state, entry, from, entries, scanStart) {
   const cal = state.calendars.find(c => c.userId === entry.userId);
   if (!cal) throw new HttpError(400, "user_has_no_calendar", { userId: entry.userId });
@@ -205,28 +212,30 @@ function findSlot(state, entry, from, entries, scanStart) {
   const personBusy = occupantBusy(state, entry.userId, scanStart, rangeEnd);
   const zBusy = zoneBusy(state, entry.zone, entry.shipId ?? null, scanStart, rangeEnd);
   const innerBusy = internalBusy(entries, entries.indexOf(entry));
+  const windows = workWindows(cal);
 
   const firstDay = new Date(from.getFullYear(), from.getMonth(), from.getDate());
 
   for (let dayOffset = 0; dayOffset <= 21; dayOffset++) {
     const dayStart = new Date(firstDay.getTime() + dayOffset * DAY_MS);
-    // 以 15 分钟为步进扫描该日工作时段。
-    for (let m = cal.workMinutes[0]; m + dur <= cal.workMinutes[1]; m += 15) {
-      const s = new Date(dayStart.getTime() + m * 60000);
-      if (s < from) continue;
-      const e = new Date(s.getTime() + dur * 60000);
-      if (m + dur > cal.workMinutes[1]) break;
-      // 午休/固定休息。
-      if ((cal.breakMinutes || []).some(([bs, be]) => overlaps(s, e,
-        new Date(dayStart.getTime() + bs * 60000), new Date(dayStart.getTime() + be * 60000)))) continue;
-      // blocked 会议/请假。
-      if (personBusy.some(b => overlaps(s, e, parseTime(b.start), parseTime(b.end)))) continue;
-      // 工序依赖。
-      if (prereqEnds.some(pe => s < pe)) continue;
-      // 桅区：跨批既有占用冲突；同船同批内部串接条目视作占用但允许在其后（已由 prereq/overlap 检查）。
-      if (zBusy.some(b => overlaps(s, e, parseTime(b.start), parseTime(b.end)))) continue;
-      if (innerBusy.some(b => overlaps(s, e, parseTime(b.start), parseTime(b.end)))) continue;
-      return { start: toLocalInput(s), end: toLocalInput(e) };
+    // 逐工作窗口（上午、下午）以 15 分钟为步进扫描；两窗口之间的午休不会被遍历到。
+    for (const [winStart, winEnd] of windows) {
+      for (let m = winStart; m + dur <= winEnd; m += 15) {
+        const s = new Date(dayStart.getTime() + m * 60000);
+        if (s < from) continue;
+        const e = new Date(s.getTime() + dur * 60000);
+        // 显式休息（午休等）双保险。
+        if ((cal.breakMinutes || []).some(([bs, be]) => overlaps(s, e,
+          new Date(dayStart.getTime() + bs * 60000), new Date(dayStart.getTime() + be * 60000)))) continue;
+        // blocked 会议/请假。
+        if (personBusy.some(b => overlaps(s, e, parseTime(b.start), parseTime(b.end)))) continue;
+        // 工序依赖。
+        if (prereqEnds.some(pe => s < pe)) continue;
+        // 桅区：跨批既有占用冲突；同船同批内部串接条目视作占用但允许在其后。
+        if (zBusy.some(b => overlaps(s, e, parseTime(b.start), parseTime(b.end)))) continue;
+        if (innerBusy.some(b => overlaps(s, e, parseTime(b.start), parseTime(b.end)))) continue;
+        return { start: toLocalInput(s), end: toLocalInput(e) };
+      }
     }
   }
   return null;
@@ -283,11 +292,17 @@ export function detectConflicts(state, batch, proposed /* [{entryId, start, end}
     const { entry, start, end } = cur;
     const cal = state.calendars.find(c => c.userId === entry.userId);
     const dayStart = new Date(start.getFullYear(), start.getMonth(), start.getDate());
-    // 负责人工作时段。
-    const ws = new Date(dayStart.getTime() + cal.workMinutes[0] * 60000);
-    const we = new Date(dayStart.getTime() + cal.workMinutes[1] * 60000);
-    if (!within(start, end, ws, we)) {
-      conflicts.push(conflict(entry, "outside_work_hours", `${ROLES.calibrator}工作时段 ${fmt(ws)}-${fmt(we)}`, p(start), p(end)));
+    // 负责人工作时段：必须完整落在上午或下午某一个窗口内；跨午休、跨天、窗外都算非工作时间。
+    let insideWindow = false;
+    for (const [wsMin, weMin] of workWindows(cal)) {
+      const ws = new Date(dayStart.getTime() + wsMin * 60000);
+      const we = new Date(dayStart.getTime() + weMin * 60000);
+      if (within(start, end, ws, we)) { insideWindow = true; break; }
+    }
+    if (!insideWindow) {
+      const winText = workWindows(cal).map(([a, b]) =>
+        `${pad(Math.floor(a / 60))}:${pad(a % 60)}-${pad(Math.floor(b / 60))}:${pad(b % 60)}`).join("、");
+      conflicts.push(conflict(entry, "outside_work_hours", `工作时段 ${winText}（午休不可排）`, p(start), p(end)));
     }
     for (const [bs, be] of cal.breakMinutes || []) {
       const bS = new Date(dayStart.getTime() + bs * 60000), bE = new Date(dayStart.getTime() + be * 60000);

@@ -48,14 +48,15 @@ export function seedState() {
       { key: "张紧", durationMinutes: 60, after: ["初调"] },
       { key: "拉力复测", durationMinutes: 45, after: ["张紧"] }
     ],
-    // 负责人工作日排期：09:00-12:00、13:30-18:00，分钟粒度。
+    // 负责人工作日排期：上午 09:00-12:00、午休 12:00-13:30、下午 13:30-18:00。
+    // workWindows 为可排窗口列表；午休 breakMinutes 为显式不可排间隔（也用于报错区分）。
     calendars: [
-      { userId: "U-ZHOU", workMinutes: [540, 720], breakMinutes: [[720, 810]], blocked: [
+      { userId: "U-ZHOU", workWindows: [[540, 720], [810, 1080]], breakMinutes: [[720, 810]], blocked: [
         { start: "2026-09-14T09:00", end: "2026-09-14T10:30", reason: "船坞例会" }
       ] },
-      { userId: "U-LIN", workMinutes: [540, 720], breakMinutes: [[720, 810]], blocked: [] },
-      { userId: "U-SHEN", workMinutes: [540, 720], breakMinutes: [[720, 810]], blocked: [] },
-      { userId: "U-ZHENG", workMinutes: [540, 720], breakMinutes: [[720, 810]], blocked: [] }
+      { userId: "U-LIN", workWindows: [[540, 720], [810, 1080]], breakMinutes: [[720, 810]], blocked: [] },
+      { userId: "U-SHEN", workWindows: [[540, 720], [810, 1080]], breakMinutes: [[720, 810]], blocked: [] },
+      { userId: "U-ZHENG", workWindows: [[540, 720], [810, 1080]], breakMinutes: [[720, 810]], blocked: [] }
     ],
     batches: [],
     // 既有桅区/负责人占用：排期时一律视作冲突（seed 中为上周已开工的校准单 B-SEED 与一条桅区封修）。
@@ -92,6 +93,45 @@ function migrate(old) {
   return state;
 }
 
+// 结构升级：旧库日历只有单窗口 workMinutes（上午），按午休 breakMinutes 拆成
+// 「上午 + 下午」双窗口 workWindows；同时给历史条目/排期补 shipId，保证桅区按船判定。
+function normalizeState(state) {
+  if (Array.isArray(state.calendars)) {
+    for (const cal of state.calendars) {
+      if (!Array.isArray(cal.workWindows)) {
+        if (Array.isArray(cal.workMinutes)) {
+          // 旧单窗口默认对应标准排班：上午 09:00-12:00、午休 12:00-13:30、下午 13:30-18:00。
+          const breaks = Array.isArray(cal.breakMinutes) ? cal.breakMinutes : [[720, 810]];
+          const [ws, we] = cal.workMinutes;
+          const windows = [[ws, we]];
+          for (const [, be] of breaks) {
+            if (be > we) windows.push([be, be + 270]); // 下午 4.5 小时到 18:00
+          }
+          cal.workWindows = windows.filter(([a, b]) => b > a);
+        } else {
+          cal.workWindows = [[540, 720], [810, 1080]];
+        }
+      }
+    }
+  }
+  if (Array.isArray(state.batches)) {
+    for (const batch of state.batches) {
+      for (const entry of batch.entries || []) {
+        if (!entry.shipId) entry.shipId = batch.shipId;
+      }
+    }
+  }
+  if (Array.isArray(state.schedules)) {
+    for (const sc of state.schedules) {
+      if (sc.shipId === undefined) {
+        const batch = (state.batches || []).find(b => b.id === sc.batchId);
+        sc.shipId = batch ? batch.shipId : null;
+      }
+    }
+  }
+  return state;
+}
+
 export class Store {
   constructor(dbPath = process.env.DB_PATH || defaultDbPath) {
     this.dbPath = dbPath;
@@ -110,6 +150,7 @@ export class Store {
         await this.persist();
       } else {
         this.state = JSON.parse(await readFile(this.dbPath, "utf8"));
+        normalizeState(this.state);
       }
     }
     return this.state;

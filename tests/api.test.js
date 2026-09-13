@@ -73,9 +73,9 @@ test("排期：自动排期遵守工序依赖、工作时段并避开种子占�
   assert.equal(kan.start, "2026-09-14T10:30");
   assert.equal(kan.end, "2026-09-14T11:30");
   assert.ok(chu.start >= kan.end, "初调不得早于勘验结束");
-  // 09-15 09:00 前桅/周宁被种子工单占用，初调 90 分钟只能排在 10:30 之后（恰好 12:00 收工）。
-  assert.equal(chu.start, "2026-09-15T10:30");
-  assert.equal(chu.end, "2026-09-15T12:00");
+  // 勘验 11:30 结束，初调 90 分钟上午放不下；午休 12:00-13:30 不可排 → 当天下午 13:30-15:00。
+  assert.equal(chu.start, "2026-09-14T13:30");
+  assert.equal(chu.end, "2026-09-14T15:00");
 });
 
 test("桅区按船判定：跨船同名桅区可同时作业，同船同区/全坞封修才报桅区占用", async () => {
@@ -475,6 +475,82 @@ test("非校准负责人：建批/加条目把复核员或交付员填成负责�
   const ov2 = await h.overview();
   assert.equal(ov2.batches.length, countBefore + 1, "非法建批未产生批次");
   assert.equal(ov2.batches.find(b => b.id === id).entries.length, 1, "非法加条目未产生条目");
+});
+
+test("工作时段双窗口：上午/午休/下午的边界与跨午休、下午占用冲突", async () => {
+  // 单条目批次（林锚），逐条改期验证窗口边界。
+  const mk = async (shipId = "S-2", zone = "后桅", idem) => {
+    const c = await h.call("POST", "/api/batches", {
+      shipId, entries: [{ position: "稳索", zone, op: "勘验", userId: USERS.lin }]
+    }, { userId: USERS.lin, idem: idem || "win-" + Math.random() });
+    return c.json.batch;
+  };
+  const put = async (b, start, end, version) => h.call("POST", `/api/batches/${b.id}/reschedule`, {
+    version, schedules: [{ entryId: b.entries[0].id, start, end }]
+  }, { userId: USERS.lin });
+  const typesOf = r => new Set(r.json.details?.conflicts?.map(c => c.type) || []);
+
+  // 下午 13:30-14:30：在班，成功。
+  let b = await mk();
+  let r = await put(b, "2026-11-09T13:30", "2026-11-09T14:30", 1);
+  assert.equal(r.status, 200, "下午时段应可排");
+
+  // 上午末段 11:30-12:00：恰好到午休起点，不重叠，成功。
+  b = await mk("S-1", "后桅", "win-m-" + Math.random());
+  r = await put(b, "2026-11-10T11:30", "2026-11-10T12:00", 1);
+  assert.equal(r.status, 200, "上午末段到午休起点应可排");
+
+  // 午休 12:00-12:30：拒绝，报午休且非工作时间。
+  b = await mk("S-1", "中桅", "win-l-" + Math.random());
+  r = await put(b, "2026-11-10T12:00", "2026-11-10T12:30", 1);
+  assert.equal(r.status, 409);
+  assert.ok(typesOf(r).has("break_time"));
+  assert.ok(typesOf(r).has("outside_work_hours"));
+
+  // 跨午休 11:00-13:30：不落在任一窗口内且压午休 → 拒绝。
+  b = await mk("S-1", "前桅", "win-x-" + Math.random());
+  r = await put(b, "2026-11-10T11:00", "2026-11-10T13:30", 1);
+  assert.equal(r.status, 409);
+  assert.ok(typesOf(r).has("break_time"), "跨午休必须报午休冲突");
+  assert.ok(typesOf(r).has("outside_work_hours"), "跨午休不能算在工作时段内");
+
+  // 下午窗口收尾 17:00-18:00：恰好到下班，成功；18:00 之后拒绝。
+  b = await mk("S-2", "前桅", "win-e-" + Math.random());
+  r = await put(b, "2026-11-11T17:00", "2026-11-11T18:00", 1);
+  assert.equal(r.status, 200, "下午到 18:00 应收尾成功");
+  r = await put(b, "2026-11-11T18:00", "2026-11-11T18:30", r.json.batch.version);
+  assert.equal(r.status, 409);
+  assert.ok(typesOf(r).has("outside_work_hours"));
+
+  // 自动排期：from 落在下午 13:30，第一个可用时段就是 13:30（不顺延次日、不进午休）。
+  b = await mk("S-2", "后桅", "win-a-" + Math.random());
+  const auto = await h.call("POST", `/api/batches/${b.id}/auto-schedule`,
+    { from: "2026-11-12T13:30", version: 1 }, { userId: USERS.lin });
+  assert.equal(auto.status, 200);
+  assert.equal(auto.json.batch.entries[0].start, "2026-11-12T13:30");
+  assert.equal(auto.json.batch.entries[0].end, "2026-11-12T14:30");
+
+  // 下午占用冲突：先让 A 占 11-13 14:00-15:00（林锚），B 同时段 → 撞人，替代时段落在当天 15:00 后。
+  const a = await mk("S-1", "前桅", "win-occ-a-" + Math.random());
+  const aPut = await put(a, "2026-11-13T14:00", "2026-11-13T15:00", 1);
+  assert.equal(aPut.status, 200);
+  const c2 = await mk("S-2", "后桅", "win-occ-b-" + Math.random());
+  r = await put(c2, "2026-11-13T14:00", "2026-11-13T15:00", 1);
+  assert.equal(r.status, 409);
+  assert.ok(typesOf(r).has("person_double_booked"), "下午既有工单仍须报撞人");
+  const alt = r.json.details.alternatives[0];
+  assert.ok(alt, "必须给出替代时段");
+  assert.ok(alt.start >= "2026-11-13T15:00", "替代时段应在占用结束之后：" + alt.start);
+
+  // 会议/请假规则保留：种子周宁 09-14 09:00-10:30 船坞例会，改进去报 person_blocked。
+  const z = await h.call("POST", "/api/batches", {
+    shipId: "S-2", entries: [{ position: "支索", zone: "后桅", op: "勘验", userId: USERS.zhou }]
+  }, { userId: USERS.zhou, idem: "win-meet-" + Math.random() });
+  const meet = await h.call("POST", `/api/batches/${z.json.batch.id}/reschedule`, {
+    version: 1, schedules: [{ entryId: z.json.batch.entries[0].id, start: "2026-09-14T09:30", end: "2026-09-14T10:00" }]
+  }, { userId: USERS.zhou });
+  assert.equal(meet.status, 409);
+  assert.ok(typesOf(meet).has("person_blocked"), "会议请假占用规则必须保留");
 });
 
 test("幂等内容：改期同键不同内容 409 不改数据，同键相同内容回放且只执行一次", async () => {
