@@ -57,13 +57,14 @@ test("重启服务后批次、排期、交付锁定与审计全部保留", async
   try {
     await waitUp(port);
 
-    const created = await api(port, "POST", "/api/batches", USERS.zhou, {
+    const createPayload = {
       shipId: "S-2",
       entries: [
         { position: "前桅侧支索", zone: "前桅", op: "勘验", userId: USERS.zhou },
         { position: "前桅侧支索", zone: "前桅", op: "初调", userId: USERS.zhou }
       ]
-    }, "restart-key-1");
+    };
+    const created = await api(port, "POST", "/api/batches", USERS.zhou, createPayload, "restart-key-1");
     const id = created.json.batch.id;
     await api(port, "POST", `/api/batches/${id}/auto-schedule`, USERS.zhou, { from: "2026-09-17T08:00", version: 1 });
     let ov = (await api(port, "GET", `/api/overview?userId=${USERS.zhou}`)).json;
@@ -100,12 +101,16 @@ test("重启服务后批次、排期、交付锁定与审计全部保留", async
     assert.equal(locked.status, 409);
     assert.equal(locked.json.error, "batch_delivered_locked");
 
-    // 幂等记录持久化：重启后同键重复提交不产生第二条。
-    const replay = await api(port, "POST", "/api/batches", USERS.zhou, {
+    // 幂等记录持久化：重启后同键 + 相同内容回放，不产生第二条；同键 + 不同内容仍拒绝。
+    const replay = await api(port, "POST", "/api/batches", USERS.zhou, createPayload, "restart-key-1");
+    assert.equal(replay.json.batch.id, id, "同幂等键同内容回放首批次");
+    assert.equal(replay.json.replayed, true);
+    const mismatch = await api(port, "POST", "/api/batches", USERS.zhou, {
       shipId: "S-2",
-      entries: [{ position: "前桅侧支索", zone: "前桅", op: "勘验", userId: USERS.zhou }]
+      entries: [{ position: "不同的索具", zone: "后桅", op: "勘验", userId: USERS.zhou }]
     }, "restart-key-1");
-    assert.equal(replay.json.batch.id, id, "同幂等键回放首批次");
+    assert.equal(mismatch.status, 409);
+    assert.equal(mismatch.json.error, "idempotency_content_mismatch");
     const finalOv = (await api(port, "GET", "/api/overview")).json;
     assert.equal(finalOv.batches.filter(x => x.id === id).length, 1);
   } finally {

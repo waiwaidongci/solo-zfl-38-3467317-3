@@ -119,6 +119,32 @@ function assertVersion(batch, body) {
   }
 }
 
+// 排期起点不得落在当前分钟之前（过期时段不允许生成）。
+function assertNotPast(text, field = "start") {
+  if (!text) return;
+  const t = parseTime(text);
+  const floor = new Date();
+  floor.setSeconds(0, 0);
+  if (t.getTime() < floor.getTime()) {
+    throw new HttpError(400, "schedule_in_past", {
+      field, given: text,
+      message: "排期时间不能落在过去"
+    });
+  }
+}
+
+// 帆索负责人只能是校准员；填成复核员/交付员一律拒绝。
+function assertCalibratorUser(state, userId) {
+  const u = findUser(state, userId);
+  if (u.role !== "calibrator") {
+    throw new HttpError(400, "assignee_must_be_calibrator", {
+      userId: u.id, role: u.role,
+      message: `帆索校准负责人必须是校准员，不能指派给${ROLES[u.role] || u.role}`
+    });
+  }
+  return u;
+}
+
 // ---- 排期引擎 ----------------------------------------------------------------
 
 // 取负责人时间窗内已排条目 + blocked 请假/会议。
@@ -432,7 +458,7 @@ export function createBatch(state, actorId, input) {
       throw new HttpError(400, "invalid_entry", { row });
     }
     opLib(state, row.op);
-    findUser(state, row.userId);
+    assertCalibratorUser(state, row.userId);
     if (!ship.zones.includes(row.zone)) {
       throw new HttpError(400, "zone_not_on_ship", { shipCode: ship.code, zone: row.zone });
     }
@@ -481,7 +507,7 @@ export function addEntry(state, actorId, batchId, body) {
   const ship = findShip(state, batch.shipId);
   if (!ship.zones.includes(row.zone)) throw new HttpError(400, "zone_not_on_ship", { zone: row.zone });
   opLib(state, row.op);
-  findUser(state, row.userId);
+  assertCalibratorUser(state, row.userId);
   batch.entries.push(mkEntry(state, ship, row));
   const at = nowIso();
   batch.version += 1;
@@ -501,6 +527,7 @@ export function autoSchedule(state, actorId, batchId, body) {
     throw new HttpError(409, "batch_not_reschedulable", { status: batch.status });
   }
   assertVersion(batch, body);
+  assertNotPast(body.from, "from");
 
   // 先在副本上试算，失败不改任何数据（事务回滚由 store 兜底，这里保证不留半成品 schedules）。
   const hidden = new Set(batch.entries.filter(e => e.schedule).map(e => e.schedule.id));
@@ -538,6 +565,7 @@ export function autoSchedule(state, actorId, batchId, body) {
 export function getSlots(state, actorId, body) {
   const actor = findUser(state, actorId);
   requireRole(actor, "batch.reschedule");
+  assertNotPast(body.from, "from");
   const planned = planSchedules(state, (body.entries || []).map((e, i) => ({
     id: e.id || "Q-" + i, clientId: e.clientId, shipId: e.shipId ?? null, shipCode: e.shipCode || "",
     position: e.position, zone: e.zone, op: e.op, userId: e.userId, schedule: null
@@ -571,6 +599,7 @@ export function rescheduleBatch(state, actorId, batchId, body) {
       });
     }
     seenEntry.add(p.entryId);
+    assertNotPast(p.start, "start");
   }
   const entryIds = batch.entries.map(e => e.id);
   const missing = entryIds.filter(id => !seenEntry.has(id));

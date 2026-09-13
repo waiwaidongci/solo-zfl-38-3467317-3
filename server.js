@@ -1,5 +1,6 @@
 // HTTP 服务：JSON API + 单页调度台。角色身份用 X-User-Id 头（会话由页面登录后保存）。
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { Store } from "./src/store.js";
 import { renderPage } from "./src/page.js";
 import {
@@ -25,8 +26,28 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-// 幂等键只在「同一动作作用域」内生效，作用域 = 动作名 + 批次 id（+ 新建端点标识）。
-// 同一键用于不同动作：返回 409 idempotency_scope_conflict，绝不回放别的动作的响应。
+// 请求内容指纹：剔除幂等键与乐观锁版本号（版本是并发控制字段，同一命令重发时会变，
+// 不属于业务内容），再按键名排序做稳定序列化。
+// 同键同动作只有在业务内容指纹一致时才回放；内容不一致直接 409 且不改数据。
+function canonicalJson(value) {
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value)
+      .filter(k => k !== "idempotencyKey" && k !== "version")
+      .sort()
+      .map(k => JSON.stringify(k) + ":" + canonicalJson(value[k]))
+      .join(",") + "}";
+  }
+  return JSON.stringify(value);
+}
+function fingerprint(body) {
+  return createHash("sha256").update(canonicalJson(body)).digest("hex");
+}
+
+// 幂等键只在「同一动作作用域 + 同一请求内容」内回放，作用域 = 动作名 + 批次 id（+ 新建端点标识）。
+// - 同键用于不同动作：409 idempotency_scope_conflict，不回放；
+// - 同键同动作但内容不同：409 idempotency_content_mismatch，不执行、不改数据；
+// - 完全一致：回放首次响应（replayed:true）。
 // 动作失败（抛错）时不缓存，客户端可用同键安全重试。
 async function mutateWithIdempotency(req, body, scope, work) {
   const key = req.headers["idempotency-key"] || body.idempotencyKey;
@@ -34,25 +55,34 @@ async function mutateWithIdempotency(req, body, scope, work) {
     const userId = req.headers["x-user-id"] || body.userId || null;
     if (key) {
       const hit = state.idempotency[key];
-      if (hit && hit.scope !== scope) {
-        throw new HttpError(409, "idempotency_scope_conflict", {
-          usedBy: hit.scope, requestedScope: scope,
-          message: "该幂等键已用于其他动作，不能回放不同动作的结果"
-        });
-      }
-      if (hit && hit.scope === scope && hit.ok) {
-        if (hit.actorId && hit.actorId !== userId) {
-          throw new HttpError(403, "idempotency_actor_mismatch", {
-            message: "该幂等键属于其他负责人，不能代为重放"
+      if (hit) {
+        if (hit.scope !== scope) {
+          throw new HttpError(409, "idempotency_scope_conflict", {
+            usedBy: hit.scope, requestedScope: scope,
+            message: "该幂等键已用于其他动作，不能回放不同动作的结果"
           });
         }
-        return { ...hit.payload, replayed: true, firstAt: hit.at };
+        const fp = fingerprint(body);
+        if (hit.fingerprint !== fp) {
+          throw new HttpError(409, "idempotency_content_mismatch", {
+            message: "该幂等键已用于内容不同的请求；请核对请求或更换新的幂等键"
+          });
+        }
+        if (hit.ok) {
+          if (hit.actorId && hit.actorId !== userId) {
+            throw new HttpError(403, "idempotency_actor_mismatch", {
+              message: "该幂等键属于其他负责人，不能代为重放"
+            });
+          }
+          return { ...hit.payload, replayed: true, firstAt: hit.at };
+        }
       }
     }
     const result = work(state, userId);
     if (key) {
       state.idempotency[key] = {
-        scope, actorId: userId, ok: true, at: new Date().toISOString(),
+        scope, actorId: userId, fingerprint: fingerprint(body),
+        ok: true, at: new Date().toISOString(),
         payload: JSON.parse(JSON.stringify(result))
       };
     }

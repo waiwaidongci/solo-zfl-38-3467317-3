@@ -325,9 +325,10 @@ test("旧版本：所有写动作带过期 version 均 409 version_conflict", as
 
 test("幂等键按动作隔离：同键先建批，再用于改期 → 409，绝不回放建批响应；换批次同动作也不串", async () => {
   const key = "cross-action-key-1";
-  const first = await h.call("POST", "/api/batches", {
+  const firstPayload = {
     shipId: "S-2", entries: [{ position: "后桅稳索", zone: "后桅", op: "勘验", userId: USERS.lin }]
-  }, { userId: USERS.lin, idem: key });
+  };
+  const first = await h.call("POST", "/api/batches", firstPayload, { userId: USERS.lin, idem: key });
   const id = first.json.batch.id;
   assert.equal(first.status, 201);
 
@@ -338,16 +339,21 @@ test("幂等键按动作隔离：同键先建批，再用于改期 → 409，绝
   assert.equal(cross.json.error, "idempotency_scope_conflict");
   assert.match(cross.json.details.message, /其他动作/);
 
-  // 同键再建批（同作用域）→ 正常回放首次建批结果，不新增。
-  const replay = await h.call("POST", "/api/batches", {
+  // 同键同动作但内容不同 → 409 idempotency_content_mismatch，不回放、不新增、不改数据。
+  const different = await h.call("POST", "/api/batches", {
     shipId: "S-2", entries: [{ position: "完全不同内容", zone: "后桅", op: "勘验", userId: USERS.lin }]
   }, { userId: USERS.lin, idem: key });
+  assert.equal(different.status, 409);
+  assert.equal(different.json.error, "idempotency_content_mismatch");
+
+  // 同键同动作且内容完全一致 → 正常回放首次建批结果，不新增。
+  const replay = await h.call("POST", "/api/batches", firstPayload, { userId: USERS.lin, idem: key });
   assert.equal(replay.status, 201);
   assert.equal(replay.json.replayed, true);
   assert.equal(replay.json.batch.id, id);
   const ov = await h.overview();
   assert.equal(ov.batches.filter(b => b.id === id).length, 1);
-  assert.equal(ov.batches.find(b => b.id === id).entries[0].position, "后桅稳索", "回放不得被新内容改写");
+  assert.equal(ov.batches.find(b => b.id === id).entries[0].position, "后桅稳索", "不同内容的请求未改写原批次");
 
   // 同键用于另一个批次的同动作（batch.reschedule:B-x）作用域不同 → 同样 409。
   const second = await h.call("POST", "/api/batches", {
@@ -404,6 +410,103 @@ test("幂等同动作重试：排期失败不占键，同键修正后可成功�
   assert.equal(replay.status, 200);
   assert.equal(replay.json.replayed, true);
   assert.equal(replay.json.batch.version, 2, "回放不得再次推进版本");
+});
+
+// ---------- 本次边界：过去时间 / 非校准负责人 ----------
+function localInput(d) {
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+test("过去时间：自动排期 from 与改期 start 落在过去均 400，不生成过期时段、不改数据", async () => {
+  const created = await h.call("POST", "/api/batches", {
+    shipId: "S-2", entries: [{ position: "后桅稳索", zone: "后桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.lin, idem: "past-" + Math.random() });
+  const id = created.json.batch.id, eid = created.json.batch.entries[0].id;
+  const past = localInput(new Date(Date.now() - 3600000));
+
+  const auto = await h.call("POST", `/api/batches/${id}/auto-schedule`,
+    { from: past, version: 1 }, { userId: USERS.lin });
+  assert.equal(auto.status, 400);
+  assert.equal(auto.json.error, "schedule_in_past");
+
+  const put = await h.call("POST", `/api/batches/${id}/reschedule`, {
+    version: 1, schedules: [{ entryId: eid, start: past, end: localInput(new Date(Date.now() - 1800000)) }]
+  }, { userId: USERS.lin });
+  assert.equal(put.status, 400);
+  assert.equal(put.json.error, "schedule_in_past");
+
+  // 没有任何排期落地，批次仍 v1、日历无该批记录。
+  const ov = await h.overview();
+  const b = ov.batches.find(x => x.id === id);
+  assert.equal(b.version, 1);
+  assert.equal(b.entries[0].start, null);
+  assert.equal(ov.calendar.filter(sc => sc.batchId === id).length, 0);
+
+  // 换成未来时间仍可正常排期。
+  const ok = await h.call("POST", `/api/batches/${id}/reschedule`, {
+    version: 1, schedules: [{ entryId: eid, start: "2026-11-05T09:00", end: "2026-11-05T10:00" }]
+  }, { userId: USERS.lin });
+  assert.equal(ok.status, 200);
+});
+
+test("非校准负责人：建批/加条目把复核员或交付员填成负责人一律 400", async () => {
+  for (const badUser of [USERS.shen, USERS.zheng]) {
+    const r = await h.call("POST", "/api/batches", {
+      shipId: "S-2", entries: [{ position: "x", zone: "前桅", op: "勘验", userId: badUser }]
+    }, { userId: USERS.zhou, idem: "bad-assignee-" + badUser });
+    assert.equal(r.status, 400);
+    assert.equal(r.json.error, "assignee_must_be_calibrator");
+  }
+  const ov1 = await h.overview();
+  const countBefore = ov1.batches.length;
+
+  // 正常建一个批次后，往里面加复核员条目也拒绝。
+  const ok = await h.call("POST", "/api/batches", {
+    shipId: "S-2", entries: [{ position: "合法索具", zone: "前桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.lin, idem: "good-batch-" + Math.random() });
+  const id = ok.json.batch.id;
+  const addBad = await h.call("POST", `/api/batches/${id}/entries`, {
+    version: 1, entry: { position: "新索", zone: "前桅", op: "勘验", userId: USERS.shen }
+  }, { userId: USERS.lin });
+  assert.equal(addBad.status, 400);
+  assert.equal(addBad.json.error, "assignee_must_be_calibrator");
+
+  const ov2 = await h.overview();
+  assert.equal(ov2.batches.length, countBefore + 1, "非法建批未产生批次");
+  assert.equal(ov2.batches.find(b => b.id === id).entries.length, 1, "非法加条目未产生条目");
+});
+
+test("幂等内容：改期同键不同内容 409 不改数据，同键相同内容回放且只执行一次", async () => {
+  const created = await h.call("POST", "/api/batches", {
+    shipId: "S-2", entries: [{ position: "后桅稳索", zone: "后桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.lin, idem: "fp-batch-" + Math.random() });
+  const id = created.json.batch.id, eid = created.json.batch.entries[0].id, key = "fp-resched-" + Math.random();
+
+  const first = await h.call("POST", `/api/batches/${id}/reschedule`, {
+    version: 1, schedules: [{ entryId: eid, start: "2026-11-06T09:00", end: "2026-11-06T10:00" }]
+  }, { userId: USERS.lin, idem: key });
+  assert.equal(first.status, 200);
+  assert.equal(first.json.batch.version, 2);
+
+  // 同键 + 不同业务内容（改到另一时段）→ 409，原时段保持，版本不增。
+  const mismatch = await h.call("POST", `/api/batches/${id}/reschedule`, {
+    version: 2, schedules: [{ entryId: eid, start: "2026-11-06T14:00", end: "2026-11-06T15:00" }]
+  }, { userId: USERS.lin, idem: key });
+  assert.equal(mismatch.status, 409);
+  assert.equal(mismatch.json.error, "idempotency_content_mismatch");
+  const ov = await h.overview();
+  const b = ov.batches.find(x => x.id === id);
+  assert.equal(b.entries[0].start, "2026-11-06T09:00");
+  assert.equal(b.version, 2);
+
+  // 同键 + 相同业务内容（版本号带当前值，指纹忽略版本）→ 回放，不再次推进版本。
+  const replay = await h.call("POST", `/api/batches/${id}/reschedule`, {
+    version: 2, schedules: [{ entryId: eid, start: "2026-11-06T09:00", end: "2026-11-06T10:00" }]
+  }, { userId: USERS.lin, idem: key });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.json.replayed, true);
+  assert.equal(replay.json.batch.version, 2);
 });
 
 // ---------- 驳回：回到校准、原记录与排期保留 ----------
