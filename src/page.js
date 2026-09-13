@@ -187,7 +187,7 @@ $("#createBtn").onclick = async () => {
       body: JSON.stringify({ shipId, entries }) });
     const batch = created.batch || created;
     await api("/api/batches/" + batch.id + "/auto-schedule", { method:"POST", idemKey:key + "-auto",
-      body: JSON.stringify({ from }) });
+      body: JSON.stringify({ from, version: batch.version }) });
     toast("批次 " + batch.id + " 已编成并排出时段");
     $("#entryRows").innerHTML = ""; addEntryRow();
     await load();
@@ -216,12 +216,12 @@ function batchCard(b, meUser){
   if (!locked) {
     if (meUser.role === "calibrator" && b.ownerId === meUser.id &&
         (b.status === STATE.text || b.status === STATE.rejected)) {
-      acts.push('<button class="sec" data-act="auto" data-b="' + b.id + '">自动排期</button>');
+      acts.push('<button class="sec" data-act="auto" data-b="' + b.id + '" data-v="' + b.version + '">自动排期</button>');
       if (b.entries.some(e => e.start)) acts.push('<button data-act="resched" data-b="' + b.id + '" data-v="' + b.version + '">整批改期</button>');
       acts.push('<button class="blue" data-act="submit" data-b="' + b.id + '" data-v="' + b.version + '">提交复核</button>');
     }
     if (meUser.role === "calibrator" && b.ownerId === meUser.id && b.status === STATE.submitted) {
-      acts.push('<button class="ghost" data-act="withdraw" data-b="' + b.id + '">撤回复核</button>');
+      acts.push('<button class="ghost" data-act="withdraw" data-b="' + b.id + '" data-v="' + b.version + '">撤回复核</button>');
     }
     if (meUser.role === "reviewer" && b.status === STATE.submitted) {
       acts.push('<button data-act="approve" data-b="' + b.id + '" data-v="' + b.version + '">复核通过</button>');
@@ -248,7 +248,7 @@ function bindBatchEvents(meUser){
       const id = btn.dataset.b, act = btn.dataset.act, ver = Number(btn.dataset.v);
       try {
         if (act === "auto") {
-          await api("/api/batches/" + id + "/auto-schedule", { method:"POST", idemKey:"auto-" + id + "-" + Date.now(), body:"{}" });
+          await api("/api/batches/" + id + "/auto-schedule", { method:"POST", idemKey:"auto-" + id + "-" + Date.now(), body: JSON.stringify({ version: ver }) });
         } else if (act === "resched") {
           const schedules = [...document.querySelectorAll('#' + id + ' input[data-e]')].reduce((acc, inp) => {
             const eid = inp.dataset.e, k = inp.dataset.k;
@@ -266,7 +266,7 @@ function bindBatchEvents(meUser){
         } else if (act === "submit") {
           await api("/api/batches/" + id + "/submit", { method:"POST", body: JSON.stringify({ version: ver }) });
         } else if (act === "withdraw") {
-          await api("/api/batches/" + id + "/withdraw", { method:"POST", body:"{}" });
+          await api("/api/batches/" + id + "/withdraw", { method:"POST", body: JSON.stringify({ version: ver }) });
         } else if (act === "approve") {
           const note = prompt("复核通过备注（可留空）") || "";
           await api("/api/batches/" + id + "/review", { method:"POST", body: JSON.stringify({ decision:"approve", version:ver, note }) });

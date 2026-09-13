@@ -65,7 +65,8 @@ test("排期：自动排期遵守工序依赖、工作时段并避开种子占�
     ]
   }, { userId: USERS.zhou, idem: "sched-" + Math.random() });
   const id = created.json.batch.id;
-  const auto = await h.call("POST", `/api/batches/${id}/auto-schedule`, { from: "2026-09-14T08:00" }, { userId: USERS.zhou });
+  const auto = await h.call("POST", `/api/batches/${id}/auto-schedule`,
+    { from: "2026-09-14T08:00", version: created.json.batch.version }, { userId: USERS.zhou });
   assert.equal(auto.status, 200);
   const [kan, chu] = auto.json.batch.entries;
   // 09-14 09:00-10:30 周宁有船坞例会 → 勘验 60 分钟排到 10:30；初调必须晚于勘验结束。
@@ -77,33 +78,62 @@ test("排期：自动排期遵守工序依赖、工作时段并避开种子占�
   assert.equal(chu.end, "2026-09-15T12:00");
 });
 
-test("排期冲突：撞种子桅区/负责人 → 409 列冲突项与替代时段", async () => {
-  const flow = await createScheduledSubmitted(h, { from: "2026-09-21T08:00" });
-  // 校准员撤回复核，回到待校准才能改期。
-  await h.call("POST", `/api/batches/${flow.final.id}/withdraw`, {}, { userId: USERS.zhou });
-  const ov = await h.overview();
-  const b = ov.batches.find(x => x.id === flow.final.id);
-  const [e1, e2] = b.entries;
-  const r = await h.call("POST", `/api/batches/${b.id}/reschedule`, {
-    version: b.version,
-    schedules: [
-      { entryId: e1.id, start: "2026-09-15T09:00", end: "2026-09-15T10:00" },
-      { entryId: e2.id, start: "2026-09-15T10:00", end: "2026-09-15T11:30" }
-    ]
+test("桅区按船判定：跨船同名桅区可同时作业，同船同区/全坞封修才报桅区占用", async () => {
+  // A：S-1 前桅 · 周宁，改到空闲日 2026-09-18 09:00-10:00（先建批再合法改期落位）。
+  const a = await h.call("POST", "/api/batches", {
+    shipId: "S-1",
+    entries: [{ position: "前桅支索", zone: "前桅", op: "勘验", userId: USERS.zhou }]
+  }, { userId: USERS.zhou, idem: "zone-a-" + Math.random() });
+  const aId = a.json.batch.id, ae = a.json.batch.entries[0].id;
+  const aPut = await h.call("POST", `/api/batches/${aId}/reschedule`, {
+    version: 1, schedules: [{ entryId: ae, start: "2026-09-18T09:00", end: "2026-09-18T10:00" }]
   }, { userId: USERS.zhou });
-  assert.equal(r.status, 409);
-  assert.equal(r.json.error, "reschedule_conflict");
-  const types = new Set(r.json.details.conflicts.map(c => c.type));
-  assert.ok(types.has("zone_occupied"), "应报桅区占用");
-  assert.ok(types.has("person_double_booked"), "应报撞人");
-  assert.ok(r.json.details.alternatives.length >= 2, "每个冲突条目都要有替代时段");
-  // 替代时段必须晚于种子占用。
-  for (const a of r.json.details.alternatives) assert.ok(a.start >= "2026-09-15T10:30");
+  assert.equal(aPut.status, 200);
+
+  // B：S-2 前桅 · 林锚（不同船不同人），同一时刻 → 必须成功。
+  const b = await h.call("POST", "/api/batches", {
+    shipId: "S-2",
+    entries: [{ position: "前桅支索", zone: "前桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.lin, idem: "zone-b-" + Math.random() });
+  const bId = b.json.batch.id, be = b.json.batch.entries[0].id;
+  const bPut = await h.call("POST", `/api/batches/${bId}/reschedule`, {
+    version: 1, schedules: [{ entryId: be, start: "2026-09-18T09:00", end: "2026-09-18T10:00" }]
+  }, { userId: USERS.lin });
+  assert.equal(bPut.status, 200, "跨船同名桅区不得互相占用");
+  const ov = await h.overview();
+  const atSameTime = ov.calendar.filter(sc => sc.start === "2026-09-18T09:00");
+  assert.equal(atSameTime.length, 2, "两条排期同时存在于日历");
+  assert.deepEqual(new Set(atSameTime.map(sc => sc.shipId)), new Set(["S-1", "S-2"]));
+
+  // C：同船 S-1 前桅（换林锚也没用，因 A 已占 S-1 前桅）→ zone_occupied。
+  const c = await h.call("POST", "/api/batches", {
+    shipId: "S-1",
+    entries: [{ position: "前桅稳索", zone: "前桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.zhou, idem: "zone-c-" + Math.random() });
+  const cId = c.json.batch.id, ce = c.json.batch.entries[0].id;
+  const cPut = await h.call("POST", `/api/batches/${cId}/reschedule`, {
+    version: 1, schedules: [{ entryId: ce, start: "2026-09-18T09:00", end: "2026-09-18T10:00" }]
+  }, { userId: USERS.zhou });
+  assert.equal(cPut.status, 409);
+  assert.ok(cPut.json.details.conflicts.some(x => x.type === "zone_occupied"), "同船同区必须冲突");
+
+  // D：全坞封修（种子 B-ZONE-FIX，shipId=null，09-16 下午 中桅）对任意船生效。
+  const d = await h.call("POST", "/api/batches", {
+    shipId: "S-1",
+    entries: [{ position: "中桅升降索", zone: "中桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.zhou, idem: "zone-d-" + Math.random() });
+  const dId = d.json.batch.id, de = d.json.batch.entries[0].id;
+  const dPut = await h.call("POST", `/api/batches/${dId}/reschedule`, {
+    version: 1, schedules: [{ entryId: de, start: "2026-09-16T14:00", end: "2026-09-16T15:00" }]
+  }, { userId: USERS.zhou });
+  assert.equal(dPut.status, 409);
+  assert.ok(dPut.json.details.conflicts.some(x => x.type === "zone_occupied"), "全坞封修应挡住所有船");
 });
 
 test("整批回滚：改期失败后原排期、版本、状态完全不变", async () => {
   const flow = await createScheduledSubmitted(h, { from: "2026-09-22T08:00" });
-  await h.call("POST", `/api/batches/${flow.final.id}/withdraw`, {}, { userId: USERS.zhou });
+  await h.call("POST", `/api/batches/${flow.final.id}/withdraw`,
+    { version: flow.final.version }, { userId: USERS.zhou });
   let ov = await h.overview();
   const before = ov.batches.find(x => x.id === flow.final.id);
   const beforeJson = JSON.stringify(before.entries.map(e => [e.id, e.start, e.end]));
@@ -131,7 +161,8 @@ test("过期版本：拿着旧 version 改期直接拒绝", async () => {
     entries: [{ position: "后桅稳索", zone: "后桅", op: "勘验", userId: USERS.lin }]
   }, { userId: USERS.lin, idem: "ver-" + Math.random() });
   const id = created.json.batch.id;
-  await h.call("POST", `/api/batches/${id}/auto-schedule`, { from: "2026-09-17T13:30" }, { userId: USERS.lin });
+  await h.call("POST", `/api/batches/${id}/auto-schedule`,
+    { from: "2026-09-17T13:30", version: created.json.batch.version }, { userId: USERS.lin });
   const ov = await h.overview();
   const current = ov.batches.find(b => b.id === id).version;
   const r = await h.call("POST", `/api/batches/${id}/reschedule`, {
@@ -149,7 +180,8 @@ test("乐观锁并发：同版本两个改期并发，只允许一个成功，�
   }, { userId: USERS.lin, idem: "conc-" + Math.random() });
   const id = created.json.batch.id;
   const eid = created.json.batch.entries[0].id;
-  await h.call("POST", `/api/batches/${id}/auto-schedule`, { from: "2026-09-20T08:00" }, { userId: USERS.lin });
+  await h.call("POST", `/api/batches/${id}/auto-schedule`,
+    { from: "2026-09-20T08:00", version: created.json.batch.version }, { userId: USERS.lin });
   const ov = await h.overview();
   const v = ov.batches.find(b => b.id === id).version;
   const body = { version: v, schedules: [{ entryId: eid, start: "2026-09-20T11:00", end: "2026-09-20T12:00" }] };
@@ -160,6 +192,218 @@ test("乐观锁并发：同版本两个改期并发，只允许一个成功，�
   const codes = [a.status, b.status].sort().join(",");
   assert.equal(codes, "200,409");
   assert.ok(a.status === 409 ? a.json.error === "version_conflict" : b.json.error === "version_conflict");
+});
+
+// ---------- 本次缺陷回归：部分条目 / 重复条目 / 缺版本 / 跨动作幂等键 ----------
+test("改期全量覆盖：漏传部分索具 → 400，概览与日历均保留原排期不丢记录", async () => {
+  const flow = await createScheduledSubmitted(h, { from: "2026-09-26T08:00" });
+  await h.call("POST", `/api/batches/${flow.final.id}/withdraw`,
+    { version: flow.final.version }, { userId: USERS.zhou });
+  let ov = await h.overview();
+  const b = ov.batches.find(x => x.id === flow.final.id);
+  assert.equal(b.entries.length, 2);
+  const beforeSlots = b.entries.map(e => [e.start, e.end]);
+
+  // 只传第一条，漏了第二条 → 拒绝。
+  const partial = await h.call("POST", `/api/batches/${b.id}/reschedule`, {
+    version: b.version,
+    schedules: [{ entryId: b.entries[0].id, start: "2026-09-26T15:00", end: "2026-09-26T16:00" }]
+  }, { userId: USERS.zhou });
+  assert.equal(partial.status, 400);
+  assert.equal(partial.json.error, "schedules_must_cover_all_entries");
+  assert.deepEqual(partial.json.details.missing, [b.entries[1].id]);
+
+  // 传不存在的条目 → 同样拒绝。
+  const unknown = await h.call("POST", `/api/batches/${b.id}/reschedule`, {
+    version: b.version,
+    schedules: [
+      ...b.entries.map(e => ({ entryId: e.id, start: e.start, end: e.end })),
+      { entryId: "E-NOPE", start: "2026-09-26T15:00", end: "2026-09-26T16:00" }
+    ]
+  }, { userId: USERS.zhou });
+  assert.equal(unknown.status, 400);
+  assert.equal(unknown.json.error, "schedules_must_cover_all_entries");
+
+  // 数据未被破坏：概览条目排期不变、日历仍是原 2 条记录。
+  ov = await h.overview();
+  const after = ov.batches.find(x => x.id === b.id);
+  assert.deepEqual(after.entries.map(e => [e.start, e.end]), beforeSlots);
+  assert.equal(ov.calendar.filter(sc => sc.batchId === b.id).length, 2);
+});
+
+test("改期去重：同一索具重复传 → 400，不生成多条排期", async () => {
+  const flow = await createScheduledSubmitted(h, { from: "2026-09-25T08:00" });
+  await h.call("POST", `/api/batches/${flow.final.id}/withdraw`,
+    { version: flow.final.version }, { userId: USERS.zhou });
+  const ov = await h.overview();
+  const b = ov.batches.find(x => x.id === flow.final.id);
+  const [e1, e2] = b.entries;
+  const dup = await h.call("POST", `/api/batches/${b.id}/reschedule`, {
+    version: b.version,
+    schedules: [
+      { entryId: e1.id, start: e1.start, end: e1.end },
+      { entryId: e1.id, start: "2026-09-27T15:00", end: "2026-09-27T16:00" },
+      { entryId: e2.id, start: e2.start, end: e2.end }
+    ]
+  }, { userId: USERS.zhou });
+  assert.equal(dup.status, 400);
+  assert.equal(dup.json.error, "duplicate_schedule_entry");
+  const ov2 = await h.overview();
+  assert.equal(ov2.calendar.filter(sc => sc.batchId === b.id).length, 2, "不得为重复条目生成多余排期");
+});
+
+test("版本必传：缺 version 的各类写请求一律 400 version_required 且不生效", async () => {
+  const created = await h.call("POST", "/api/batches", {
+    shipId: "S-2", entries: [{ position: "后桅稳索", zone: "后桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.lin, idem: "nov-" + Math.random() });
+  const id = created.json.batch.id, eid = created.json.batch.entries[0].id;
+
+  const noVerAuto = await h.call("POST", `/api/batches/${id}/auto-schedule`, { from: "2026-09-28T08:00" }, { userId: USERS.lin });
+  assert.equal(noVerAuto.status, 400);
+  assert.equal(noVerAuto.json.error, "version_required");
+
+  const noVerResched = await h.call("POST", `/api/batches/${id}/reschedule`,
+    { schedules: [{ entryId: eid, start: "2026-09-28T09:00", end: "2026-09-28T10:00" }] }, { userId: USERS.lin });
+  assert.equal(noVerResched.status, 400);
+  assert.equal(noVerResched.json.error, "version_required");
+
+  // 合法自动排期后，提交/复核/交付缺版本同样拒绝。
+  const auto = await h.call("POST", `/api/batches/${id}/auto-schedule`,
+    { from: "2026-09-28T08:00", version: 1 }, { userId: USERS.lin });
+  const vAfterAuto = auto.json.batch.version;
+  const noVerSubmit = await h.call("POST", `/api/batches/${id}/submit`, {}, { userId: USERS.lin });
+  assert.equal(noVerSubmit.status, 400);
+  assert.equal(noVerSubmit.json.error, "version_required");
+
+  await h.call("POST", `/api/batches/${id}/submit`, { version: vAfterAuto }, { userId: USERS.lin });
+  const noVerReview = await h.call("POST", `/api/batches/${id}/review`,
+    { decision: "approve" }, { userId: USERS.shen });
+  assert.equal(noVerReview.status, 400);
+  assert.equal(noVerReview.json.error, "version_required");
+
+  const ov = await h.overview();
+  const submittedV = ov.batches.find(x => x.id === id).version;
+  await h.call("POST", `/api/batches/${id}/review`, { decision: "approve", version: submittedV }, { userId: USERS.shen });
+  const ov2 = await h.overview();
+  const approvedV = ov2.batches.find(x => x.id === id).version;
+  const noVerDeliver = await h.call("POST", `/api/batches/${id}/deliver`, {}, { userId: USERS.zheng });
+  assert.equal(noVerDeliver.status, 400);
+  assert.equal(noVerDeliver.json.error, "version_required");
+  // 未真的交付。
+  const ov3 = await h.overview();
+  assert.equal(ov3.batches.find(x => x.id === id).status, "复核通过");
+  assert.equal(ov3.batches.find(x => x.id === id).version, approvedV);
+});
+
+test("旧版本：所有写动作带过期 version 均 409 version_conflict", async () => {
+  const flow = await createScheduledSubmitted(h, { from: "2026-09-29T08:00" });
+  const id = flow.final.id, stale = flow.batch.version; // v1，当前已经是提交后的更高版本
+  const r1 = await h.call("POST", `/api/batches/${id}/withdraw`, { version: stale }, { userId: USERS.zhou });
+  assert.equal(r1.status, 409);
+  assert.equal(r1.json.error, "version_conflict");
+  const r2 = await h.call("POST", `/api/batches/${id}/review`,
+    { decision: "reject", note: "x", version: stale }, { userId: USERS.shen });
+  assert.equal(r2.status, 409);
+  assert.equal(r2.json.error, "version_conflict");
+
+  // 走到复核通过，再用旧版本号交付 → 同样 version_conflict（状态已可交付，纯粹是版本过期）。
+  const cur = await h.call("POST", `/api/batches/${id}/review`,
+    { decision: "approve", version: flow.final.version }, { userId: USERS.shen });
+  const r3 = await h.call("POST", `/api/batches/${id}/deliver`, { version: stale }, { userId: USERS.zheng });
+  assert.equal(r3.status, 409);
+  assert.equal(r3.json.error, "version_conflict");
+  // 批次未被错误交付。
+  const ov = await h.overview();
+  assert.equal(ov.batches.find(b => b.id === id).status, "复核通过");
+
+  // 用当前版本仍可正常交付。
+  const ok = await h.call("POST", `/api/batches/${id}/deliver`,
+    { version: cur.json.batch.version }, { userId: USERS.zheng });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.batch.status, "已交付");
+});
+
+test("幂等键按动作隔离：同键先建批，再用于改期 → 409，绝不回放建批响应；换批次同动作也不串", async () => {
+  const key = "cross-action-key-1";
+  const first = await h.call("POST", "/api/batches", {
+    shipId: "S-2", entries: [{ position: "后桅稳索", zone: "后桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.lin, idem: key });
+  const id = first.json.batch.id;
+  assert.equal(first.status, 201);
+
+  // 同键拿去自动排期（不同动作作用域）→ 409，不能拿到建批的响应。
+  const cross = await h.call("POST", `/api/batches/${id}/auto-schedule`,
+    { from: "2026-09-30T08:00", version: 1 }, { userId: USERS.lin, idem: key });
+  assert.equal(cross.status, 409);
+  assert.equal(cross.json.error, "idempotency_scope_conflict");
+  assert.match(cross.json.details.message, /其他动作/);
+
+  // 同键再建批（同作用域）→ 正常回放首次建批结果，不新增。
+  const replay = await h.call("POST", "/api/batches", {
+    shipId: "S-2", entries: [{ position: "完全不同内容", zone: "后桅", op: "勘验", userId: USERS.lin }]
+  }, { userId: USERS.lin, idem: key });
+  assert.equal(replay.status, 201);
+  assert.equal(replay.json.replayed, true);
+  assert.equal(replay.json.batch.id, id);
+  const ov = await h.overview();
+  assert.equal(ov.batches.filter(b => b.id === id).length, 1);
+  assert.equal(ov.batches.find(b => b.id === id).entries[0].position, "后桅稳索", "回放不得被新内容改写");
+
+  // 同键用于另一个批次的同动作（batch.reschedule:B-x）作用域不同 → 同样 409。
+  const second = await h.call("POST", "/api/batches", {
+    shipId: "S-2", entries: [{ position: "前桅支索", zone: "前桅", op: "勘验", userId: USERS.zhou }]
+  }, { userId: USERS.zhou, idem: "scope-key-2" });
+  const id2 = second.json.batch.id;
+  // id2 先合法自动排期（它自己的键），再拿 id 的同动作键改 id2。
+  await h.call("POST", `/api/batches/${id2}/auto-schedule`,
+    { from: "2026-09-30T08:00", version: 1 }, { userId: USERS.zhou, idem: "scope-key-2-auto" });
+  const ov2 = await h.overview();
+  const v2 = ov2.batches.find(b => b.id === id2).version;
+  // scope-key-2 已用于 batch.create，现用于 auto/reschedule 也必须冲突。
+  const cross2 = await h.call("POST", `/api/batches/${id2}/reschedule`, {
+    version: v2,
+    schedules: [{ entryId: second.json.batch.entries[0].id, start: "2026-10-01T09:00", end: "2026-10-01T10:00" }]
+  }, { userId: USERS.zhou, idem: "scope-key-2" });
+  assert.equal(cross2.status, 409);
+  assert.equal(cross2.json.error, "idempotency_scope_conflict");
+});
+
+test("幂等同动作重试：排期失败不占键，同键修正后可成功；成功再提交则回放", async () => {
+  const key = "same-action-retry-1";
+  const created = await h.call("POST", "/api/batches", {
+    shipId: "S-2",
+    entries: [
+      { position: "前桅支索", zone: "前桅", op: "勘验", userId: USERS.zhou },
+      { position: "前桅支索", zone: "前桅", op: "初调", userId: USERS.zhou }
+    ]
+  }, { userId: USERS.zhou, idem: "same-action-create" });
+  const id = created.json.batch.id;
+  // 第一次改期用旧版本号 → 409，键不被占用。
+  const bad = await h.call("POST", `/api/batches/${id}/reschedule`, {
+    version: 99,
+    schedules: created.json.batch.entries.map(e => ({ entryId: e.id, start: "2026-10-02T09:00", end: "2026-10-02T10:00" }))
+  }, { userId: USERS.zhou, idem: key });
+  assert.equal(bad.status, 409);
+  // 同键用正确版本再来一次（条目数=2，给合法且互不重叠的时段）→ 成功。
+  const good = await h.call("POST", `/api/batches/${id}/reschedule`, {
+    version: 1,
+    schedules: [
+      { entryId: created.json.batch.entries[0].id, start: "2026-10-02T09:00", end: "2026-10-02T10:00" },
+      { entryId: created.json.batch.entries[1].id, start: "2026-10-02T10:00", end: "2026-10-02T11:30" }
+    ]
+  }, { userId: USERS.zhou, idem: key });
+  assert.equal(good.status, 200);
+  // 再用同键提交相同请求 → 回放，版本不再增加。
+  const replay = await h.call("POST", `/api/batches/${id}/reschedule`, {
+    version: 2,
+    schedules: [
+      { entryId: created.json.batch.entries[0].id, start: "2026-10-02T09:00", end: "2026-10-02T10:00" },
+      { entryId: created.json.batch.entries[1].id, start: "2026-10-02T10:00", end: "2026-10-02T11:30" }
+    ]
+  }, { userId: USERS.zhou, idem: key });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.json.replayed, true);
+  assert.equal(replay.json.batch.version, 2, "回放不得再次推进版本");
 });
 
 // ---------- 驳回：回到校准、原记录与排期保留 ----------

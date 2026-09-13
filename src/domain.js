@@ -103,16 +103,20 @@ function assertNotDelivered(batch) {
   }
 }
 
-// 幂等：同 key 重复提交直接返回首次结果，绝不生成第二条记录。
-function idempotent(state, key, producer) {
-  if (!key) return producer();
-  const cached = state.idempotency[key];
-  if (cached) return { ...cached, replayed: true };
-  const created = producer();
-  state.idempotency[key] = {
-    kind: created.kind, id: created.id, batchId: created.batchId, at: created.at
-  };
-  return created;
+// 乐观锁：版本号缺失 400，过期 409，均不得执行。
+function assertVersion(batch, body) {
+  if (typeof body.version !== "number") {
+    throw new HttpError(400, "version_required", {
+      expected: batch.version,
+      message: "请求必须携带当前版本号 version"
+    });
+  }
+  if (body.version !== batch.version) {
+    throw new HttpError(409, "version_conflict", {
+      expected: batch.version, got: body.version,
+      message: "批次已被他人改动（过期版本），请刷新后重试"
+    });
+  }
 }
 
 // ---- 排期引擎 ----------------------------------------------------------------
@@ -134,10 +138,13 @@ function occupantBusy(state, userId, rangeStart, rangeEnd) {
   }
   return busy;
 }
-function zoneBusy(state, zone, rangeStart, rangeEnd) {
+// 桅区占用按「船 + 桅区」共同判定：不同船的同名桅区互不占用；
+// shipId 为 null 的记录表示全坞性桅区封修，对所有船生效。
+function zoneBusy(state, zone, shipId, rangeStart, rangeEnd) {
   const busy = [];
   for (const sc of state.schedules) {
     if (sc.status !== "active" || sc.zone !== zone) continue;
+    if (sc.shipId !== null && shipId !== null && sc.shipId !== shipId) continue;
     const s = parseTime(sc.start);
     if (s < rangeStart || s >= rangeEnd) continue;
     busy.push({ start: sc.start, end: sc.end, reason: `桅区占用 ${sc.batchId}/${sc.op}` });
@@ -170,7 +177,7 @@ function findSlot(state, entry, from, entries, scanStart) {
 
   const rangeEnd = new Date(scanStart.getTime() + 28 * DAY_MS);
   const personBusy = occupantBusy(state, entry.userId, scanStart, rangeEnd);
-  const zBusy = zoneBusy(state, entry.zone, scanStart, rangeEnd);
+  const zBusy = zoneBusy(state, entry.zone, entry.shipId ?? null, scanStart, rangeEnd);
   const innerBusy = internalBusy(entries, entries.indexOf(entry));
 
   const firstDay = new Date(from.getFullYear(), from.getMonth(), from.getDate());
@@ -273,12 +280,15 @@ export function detectConflicts(state, batch, proposed /* [{entryId, start, end}
         conflicts.push(conflict(entry, "person_double_booked", `与工单 ${sc.batchId} · ${sc.op} 撞人`, p(start), p(end)));
       }
     }
-    // 桅区占用（排除本批次自身）。
+    // 桅区占用（排除本批次自身）：必须同船且同桅区才算占用；
+    // shipId 为 null 的全坞封修对所有船生效。
     for (const sc of state.schedules) {
       if (sc.status !== "active" || sc.batchId === batch.id) continue;
       if (sc.zone !== entry.zone) continue;
+      if (sc.shipId !== null && sc.shipId !== batch.shipId) continue;
       if (overlaps(start, end, parseTime(sc.start), parseTime(sc.end))) {
-        conflicts.push(conflict(entry, "zone_occupied", `桅区「${entry.zone}」被 ${sc.batchId} · ${sc.op} 占用`, p(start), p(end)));
+        conflicts.push(conflict(entry, "zone_occupied",
+          `${sc.shipId === null ? "全坞" : "桅区"}「${entry.zone}」被 ${sc.batchId} · ${sc.op} 占用`, p(start), p(end)));
       }
     }
     // 工序依赖：起点早于同桅前置工序结束。
@@ -416,38 +426,36 @@ export function createBatch(state, actorId, input) {
   requireRole(actor, "batch.create");
   const ship = findShip(state, input.shipId);
   const at = nowIso();
-  const made = idempotent(state, input.idempotencyKey, () => {
-    const entries = [];
-    for (const row of input.entries || []) {
-      if (!row.position || !row.zone || !row.op || !row.userId) {
-        throw new HttpError(400, "invalid_entry", { row });
-      }
-      opLib(state, row.op);
-      findUser(state, row.userId);
-      if (!ship.zones.includes(row.zone)) {
-        throw new HttpError(400, "zone_not_on_ship", { shipCode: ship.code, zone: row.zone });
-      }
-      entries.push(mkEntry(state, ship, row));
+  const entries = [];
+  for (const row of input.entries || []) {
+    if (!row.position || !row.zone || !row.op || !row.userId) {
+      throw new HttpError(400, "invalid_entry", { row });
     }
-    if (!entries.length) throw new HttpError(400, "empty_batch");
-    const id = "B-" + ++state.seq;
-    const batch = {
-      id, shipId: ship.id, shipCode: ship.code, ownerId: actor.id, ownerName: actor.name,
-      status: BATCH_STATUS.DRAFT, version: 1, createdAt: at, submittedAt: null, reviewedAt: null,
-      deliveredAt: null, entries,
-      history: [{ at, action: "create", actorId, actorName: actor.name, note: "编成校准批次" }]
-    };
-    state.batches.push(batch);
-    addAudit(state, { at, actorId, action: "batch.create", batchId: id,
-      detail: { shipCode: ship.code, entries: entries.length } });
-    return { kind: "batch", id, batchId: id, at, batch: summarizeBatch(batch) };
-  });
-  return made;
+    opLib(state, row.op);
+    findUser(state, row.userId);
+    if (!ship.zones.includes(row.zone)) {
+      throw new HttpError(400, "zone_not_on_ship", { shipCode: ship.code, zone: row.zone });
+    }
+    entries.push(mkEntry(state, ship, row));
+  }
+  if (!entries.length) throw new HttpError(400, "empty_batch");
+  const id = "B-" + ++state.seq;
+  const batch = {
+    id, shipId: ship.id, shipCode: ship.code, ownerId: actor.id, ownerName: actor.name,
+    status: BATCH_STATUS.DRAFT, version: 1, createdAt: at, submittedAt: null, reviewedAt: null,
+    deliveredAt: null, entries,
+    history: [{ at, action: "create", actorId, actorName: actor.name, note: "编成校准批次" }]
+  };
+  state.batches.push(batch);
+  addAudit(state, { at, actorId, action: "batch.create", batchId: id,
+    detail: { shipCode: ship.code, entries: entries.length } });
+  return { kind: "batch", id, batchId: id, at, batch: summarizeBatch(batch) };
 }
 
 function mkEntry(state, ship, row) {
   return {
     id: "E-" + ++state.seq,
+    shipId: ship.id,
     shipCode: ship.code,
     position: row.position,
     zone: row.zone,
@@ -467,9 +475,7 @@ export function addEntry(state, actorId, batchId, body) {
   if (![BATCH_STATUS.DRAFT, BATCH_STATUS.REJECTED].includes(batch.status)) {
     throw new HttpError(409, "batch_not_editable", { status: batch.status });
   }
-  if (typeof body.version === "number" && body.version !== batch.version) {
-    throw new HttpError(409, "version_conflict", { expected: batch.version, got: body.version });
-  }
+  assertVersion(batch, body);
   const row = body.entry || {};
   if (!row.position || !row.zone || !row.op || !row.userId) throw new HttpError(400, "invalid_entry", { row });
   const ship = findShip(state, batch.shipId);
@@ -494,6 +500,7 @@ export function autoSchedule(state, actorId, batchId, body) {
   if (![BATCH_STATUS.DRAFT, BATCH_STATUS.REJECTED].includes(batch.status)) {
     throw new HttpError(409, "batch_not_reschedulable", { status: batch.status });
   }
+  assertVersion(batch, body);
 
   // 先在副本上试算，失败不改任何数据（事务回滚由 store 兜底，这里保证不留半成品 schedules）。
   const hidden = new Set(batch.entries.filter(e => e.schedule).map(e => e.schedule.id));
@@ -501,7 +508,8 @@ export function autoSchedule(state, actorId, batchId, body) {
   state.schedules = kept.filter(sc => !hidden.has(sc.id));
   let planned;
   try {
-    planned = planSchedules(state, batch.entries, body.from);
+    // 旧数据条目可能没有 shipId，以批次船 id 兜底，保证桅区按船判定。
+    planned = planSchedules(state, batch.entries.map(e => ({ ...e, shipId: e.shipId || batch.shipId })), body.from);
   } finally {
     state.schedules = kept;
   }
@@ -531,14 +539,14 @@ export function getSlots(state, actorId, body) {
   const actor = findUser(state, actorId);
   requireRole(actor, "batch.reschedule");
   const planned = planSchedules(state, (body.entries || []).map((e, i) => ({
-    id: e.id || "Q-" + i, clientId: e.clientId, shipCode: e.shipCode || "", position: e.position,
-    zone: e.zone, op: e.op, userId: e.userId, schedule: null
+    id: e.id || "Q-" + i, clientId: e.clientId, shipId: e.shipId ?? null, shipCode: e.shipCode || "",
+    position: e.position, zone: e.zone, op: e.op, userId: e.userId, schedule: null
   })), body.from);
   return planned;
 }
 
-// 整批改期：乐观锁 version 校验 → 冲突试算 → 有冲突返回冲突项+替代时段且不写任何数据；
-// 无冲突才整批替换并自增版本。任何失败由事务整体回滚。
+// 整批改期：版本必传 → 全量覆盖且每项唯一 → 冲突试算 → 有冲突返回冲突项+替代时段且不写任何数据；
+// 无冲突才整批替换并自增版本。任何失败由事务整体回滚，绝不留半批次。
 export function rescheduleBatch(state, actorId, batchId, body) {
   const actor = findUser(state, actorId);
   requireRole(actor, "batch.reschedule");
@@ -548,17 +556,33 @@ export function rescheduleBatch(state, actorId, batchId, body) {
   if (![BATCH_STATUS.DRAFT, BATCH_STATUS.REJECTED].includes(batch.status)) {
     throw new HttpError(409, "batch_not_reschedulable", { status: batch.status });
   }
-  if (typeof body.version === "number" && body.version !== batch.version) {
-    throw new HttpError(409, "version_conflict", {
-      expected: batch.version, got: body.version,
-      message: "批次已被他人改动（过期版本），请刷新后重试"
-    });
-  }
+  assertVersion(batch, body);
+
   const proposed = body.schedules;
   if (!Array.isArray(proposed) || !proposed.length) throw new HttpError(400, "schedules_required");
-  const ids = new Set(batch.entries.map(e => e.id));
-  if (!proposed.every(p => ids.has(p.entryId))) throw new HttpError(400, "unknown_entry_in_schedules");
 
+  // 每项索具必须恰好出现一次：不允许漏传，也不允许重复传。
+  const seenEntry = new Set();
+  for (const p of proposed) {
+    if (!p || typeof p.entryId !== "string") throw new HttpError(400, "invalid_schedule_item");
+    if (seenEntry.has(p.entryId)) {
+      throw new HttpError(400, "duplicate_schedule_entry", {
+        entryId: p.entryId, message: "同一索具条目在改期请求中重复出现"
+      });
+    }
+    seenEntry.add(p.entryId);
+  }
+  const entryIds = batch.entries.map(e => e.id);
+  const missing = entryIds.filter(id => !seenEntry.has(id));
+  const unknown = [...seenEntry].filter(id => !entryIds.includes(id));
+  if (missing.length || unknown.length) {
+    throw new HttpError(400, "schedules_must_cover_all_entries", {
+      expected: entryIds, received: [...seenEntry], missing, unknown,
+      message: "改期必须一次覆盖全部索具条目，既不能漏传，也不能传不存在的条目"
+    });
+  }
+
+  // 冲突试算（只读，不改任何状态）。
   const conflicts = detectConflicts(state, batch, proposed);
   if (conflicts.length) {
     const alt = alternatives(state, batch,
@@ -573,18 +597,20 @@ export function rescheduleBatch(state, actorId, batchId, body) {
     throw err;
   }
 
-  // 整批替换：先动 entries 内存，再重建 schedules；任何一步抛错，store 恢复快照。
-  const oldSchedules = state.schedules;
-  state.schedules = oldSchedules.filter(sc => sc.batchId !== batch.id);
+  // 全部校验通过后才一次性落盘替换：旧 schedules 整组摘除，新 schedules 整组挂上。
+  state.schedules = state.schedules.filter(sc => sc.batchId !== batch.id);
+  const replacementSchedules = [];
   for (const p of proposed) {
     const entry = batch.entries.find(e => e.id === p.entryId);
     entry.schedule = { id: "SC-" + ++state.seq, start: p.start, end: p.end };
-    state.schedules.push({
+    replacementSchedules.push({
       id: entry.schedule.id, batchId: batch.id, entryId: entry.id, shipId: batch.shipId,
       zone: entry.zone, userId: entry.userId, op: entry.op,
       start: p.start, end: p.end, status: "active"
     });
   }
+  state.schedules.push(...replacementSchedules);
+
   const at = nowIso();
   batch.version += 1;
   batch.history.push({ at, action: "reschedule", actorId, actorName: actor.name,
@@ -603,9 +629,7 @@ export function submitBatch(state, actorId, batchId, body = {}) {
   if (![BATCH_STATUS.DRAFT, BATCH_STATUS.REJECTED].includes(batch.status)) {
     throw new HttpError(409, "batch_not_submittable", { status: batch.status });
   }
-  if (typeof body.version === "number" && body.version !== batch.version) {
-    throw new HttpError(409, "version_conflict", { expected: batch.version, got: body.version });
-  }
+  assertVersion(batch, body);
   if (!batch.entries.every(e => e.schedule)) throw new HttpError(409, "unscheduled_entries");
   const at = nowIso();
   batch.status = BATCH_STATUS.SUBMITTED;
@@ -616,13 +640,14 @@ export function submitBatch(state, actorId, batchId, body = {}) {
   return { batch: summarizeBatch(batch) };
 }
 
-export function withdrawBatch(state, actorId, batchId) {
+export function withdrawBatch(state, actorId, batchId, body = {}) {
   const actor = findUser(state, actorId);
   requireRole(actor, "batch.withdraw");
   const batch = findBatch(state, batchId);
   assertNotDelivered(batch);
   if (batch.ownerId !== actor.id) throw new HttpError(403, "forbidden_not_owner");
   if (batch.status !== BATCH_STATUS.SUBMITTED) throw new HttpError(409, "batch_not_withdrawable", { status: batch.status });
+  assertVersion(batch, body);
   const at = nowIso();
   batch.status = BATCH_STATUS.DRAFT;
   batch.version += 1;
@@ -641,9 +666,7 @@ export function reviewBatch(state, actorId, batchId, decision, body = {}) {
   if (batch.status !== BATCH_STATUS.SUBMITTED) {
     throw new HttpError(409, "batch_not_in_review", { status: batch.status });
   }
-  if (typeof body.version === "number" && body.version !== batch.version) {
-    throw new HttpError(409, "version_conflict", { expected: batch.version, got: body.version });
-  }
+  assertVersion(batch, body);
   const at = nowIso();
   if (decision === "approve") {
     batch.status = BATCH_STATUS.APPROVED;
@@ -673,9 +696,7 @@ export function deliverBatch(state, actorId, batchId, body = {}) {
   const batch = findBatch(state, batchId);
   assertNotDelivered(batch);
   if (batch.status !== BATCH_STATUS.APPROVED) throw new HttpError(409, "batch_not_deliverable", { status: batch.status });
-  if (typeof body.version === "number" && body.version !== batch.version) {
-    throw new HttpError(409, "version_conflict", { expected: batch.version, got: body.version });
-  }
+  assertVersion(batch, body);
   const at = nowIso();
   batch.status = BATCH_STATUS.DELIVERED;
   batch.deliveredAt = at;

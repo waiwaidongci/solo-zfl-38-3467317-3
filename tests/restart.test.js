@@ -65,7 +65,7 @@ test("重启服务后批次、排期、交付锁定与审计全部保留", async
       ]
     }, "restart-key-1");
     const id = created.json.batch.id;
-    await api(port, "POST", `/api/batches/${id}/auto-schedule`, USERS.zhou, { from: "2026-09-17T08:00" });
+    await api(port, "POST", `/api/batches/${id}/auto-schedule`, USERS.zhou, { from: "2026-09-17T08:00", version: 1 });
     let ov = (await api(port, "GET", `/api/overview?userId=${USERS.zhou}`)).json;
     const submittedVersion = ov.batches.find(b => b.id === id).version;
     await api(port, "POST", `/api/batches/${id}/submit`, USERS.zhou, { version: submittedVersion });

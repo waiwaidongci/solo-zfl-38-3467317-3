@@ -56,7 +56,10 @@ export async function createScheduledSubmitted(h, {
   ];
   const created = await h.call("POST", "/api/batches", { shipId, entries }, { userId, idem: "k-" + Math.random() });
   const batch = created.json.batch;
-  await h.call("POST", `/api/batches/${batch.id}/auto-schedule`, { from }, { userId });
-  const submitted = await h.call("POST", `/api/batches/${batch.id}/submit`, {}, { userId });
-  return { batch, final: submitted.json.batch };
+  const auto = await h.call("POST", `/api/batches/${batch.id}/auto-schedule`,
+    { from, version: batch.version }, { userId });
+  const scheduled = auto.json.batch;
+  const submitted = await h.call("POST", `/api/batches/${batch.id}/submit`,
+    { version: scheduled.version }, { userId });
+  return { batch, scheduled, final: submitted.json.batch };
 }

@@ -25,29 +25,39 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-// HTTP 层幂等：同一 Idempotency-Key 的重复提交直接回放首次响应，绝不产生第二条记录。
-async function withIdempotency(state, req, body, work) {
+// 幂等键只在「同一动作作用域」内生效，作用域 = 动作名 + 批次 id（+ 新建端点标识）。
+// 同一键用于不同动作：返回 409 idempotency_scope_conflict，绝不回放别的动作的响应。
+// 动作失败（抛错）时不缓存，客户端可用同键安全重试。
+async function mutateWithIdempotency(req, body, scope, work) {
   const key = req.headers["idempotency-key"] || body.idempotencyKey;
-  if (key) {
-    const hit = state.idempotency[key];
-    if (hit && hit.http) {
-      return { ...hit.http.payload, replayed: true, firstAt: hit.http.at };
-    }
-  }
-  const result = await work();
-  if (key) {
-    state.idempotency[key] = state.idempotency[key] || {};
-    state.idempotency[key].http = { at: new Date().toISOString(), payload: JSON.parse(JSON.stringify(result)) };
-  }
-  return result;
-}
-
-// 在同一事务内执行动作；domain 抛 HttpError 时事务回滚（store 已恢复快照），错误照常返回。
-async function tx(req, body, fn) {
-  return store.mutate(state => withIdempotency(state, req, body, () => {
+  return store.mutate(state => {
     const userId = req.headers["x-user-id"] || body.userId || null;
-    return fn(state, userId, body);
-  }));
+    if (key) {
+      const hit = state.idempotency[key];
+      if (hit && hit.scope !== scope) {
+        throw new HttpError(409, "idempotency_scope_conflict", {
+          usedBy: hit.scope, requestedScope: scope,
+          message: "该幂等键已用于其他动作，不能回放不同动作的结果"
+        });
+      }
+      if (hit && hit.scope === scope && hit.ok) {
+        if (hit.actorId && hit.actorId !== userId) {
+          throw new HttpError(403, "idempotency_actor_mismatch", {
+            message: "该幂等键属于其他负责人，不能代为重放"
+          });
+        }
+        return { ...hit.payload, replayed: true, firstAt: hit.at };
+      }
+    }
+    const result = work(state, userId);
+    if (key) {
+      state.idempotency[key] = {
+        scope, actorId: userId, ok: true, at: new Date().toISOString(),
+        payload: JSON.parse(JSON.stringify(result))
+      };
+    }
+    return result;
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -66,51 +76,61 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, data);
     }
 
-    if (req.method === "POST" && pathname === "/api/batches") {
-      const body = await readBody(req);
-      const data = await tx(req, body, (state, userId) => createBatch(state, userId, body));
-      return sendJson(res, 201, data);
-    }
-
+    // 只读预演：不进入幂等/写事务。
     let m = pathname.match(/^\/api\/batches\/([^/]+)\/slots$/);
     if (m && req.method === "POST") {
       const body = await readBody(req);
-      const data = await tx(req, body, (state, userId) => getSlots(state, userId, body));
+      const data = await store.read(state => {
+        const userId = req.headers["x-user-id"] || body.userId || null;
+        return getSlots(state, userId, body);
+      });
       return sendJson(res, 200, data);
+    }
+
+    if (req.method === "POST" && pathname === "/api/batches") {
+      const body = await readBody(req);
+      const data = await mutateWithIdempotency(req, body, "batch.create",
+        (state, userId) => createBatch(state, userId, body));
+      return sendJson(res, 201, data);
     }
 
     m = pathname.match(/^\/api\/batches\/([^/]+)\/entries$/);
     if (m && req.method === "POST") {
       const body = await readBody(req);
-      const data = await tx(req, body, (state, userId) => addEntry(state, userId, m[1], body));
+      const data = await mutateWithIdempotency(req, body, `entry.add:${m[1]}`,
+        (state, userId) => addEntry(state, userId, m[1], body));
       return sendJson(res, 201, data);
     }
 
     m = pathname.match(/^\/api\/batches\/([^/]+)\/auto-schedule$/);
     if (m && req.method === "POST") {
       const body = await readBody(req);
-      const data = await tx(req, body, (state, userId) => autoSchedule(state, userId, m[1], body));
+      const data = await mutateWithIdempotency(req, body, `batch.auto_schedule:${m[1]}`,
+        (state, userId) => autoSchedule(state, userId, m[1], body));
       return sendJson(res, 200, data);
     }
 
     m = pathname.match(/^\/api\/batches\/([^/]+)\/reschedule$/);
     if (m && req.method === "POST") {
       const body = await readBody(req);
-      const data = await tx(req, body, (state, userId) => rescheduleBatch(state, userId, m[1], body));
+      const data = await mutateWithIdempotency(req, body, `batch.reschedule:${m[1]}`,
+        (state, userId) => rescheduleBatch(state, userId, m[1], body));
       return sendJson(res, 200, data);
     }
 
     m = pathname.match(/^\/api\/batches\/([^/]+)\/submit$/);
     if (m && req.method === "POST") {
       const body = await readBody(req);
-      const data = await tx(req, body, (state, userId) => submitBatch(state, userId, m[1], body));
+      const data = await mutateWithIdempotency(req, body, `batch.submit:${m[1]}`,
+        (state, userId) => submitBatch(state, userId, m[1], body));
       return sendJson(res, 200, data);
     }
 
     m = pathname.match(/^\/api\/batches\/([^/]+)\/withdraw$/);
     if (m && req.method === "POST") {
       const body = await readBody(req);
-      const data = await tx(req, body, (state, userId) => withdrawBatch(state, userId, m[1]));
+      const data = await mutateWithIdempotency(req, body, `batch.withdraw:${m[1]}`,
+        (state, userId) => withdrawBatch(state, userId, m[1], body));
       return sendJson(res, 200, data);
     }
 
@@ -118,14 +138,16 @@ const server = http.createServer(async (req, res) => {
     if (m && req.method === "POST") {
       const body = await readBody(req);
       const decision = body.decision === "approve" ? "approve" : "reject";
-      const data = await tx(req, body, (state, userId) => reviewBatch(state, userId, m[1], decision, body));
+      const data = await mutateWithIdempotency(req, body, `batch.${decision}:${m[1]}`,
+        (state, userId) => reviewBatch(state, userId, m[1], decision, body));
       return sendJson(res, 200, data);
     }
 
     m = pathname.match(/^\/api\/batches\/([^/]+)\/deliver$/);
     if (m && req.method === "POST") {
       const body = await readBody(req);
-      const data = await tx(req, body, (state, userId) => deliverBatch(state, userId, m[1], body));
+      const data = await mutateWithIdempotency(req, body, `batch.deliver:${m[1]}`,
+        (state, userId) => deliverBatch(state, userId, m[1], body));
       return sendJson(res, 200, data);
     }
 
